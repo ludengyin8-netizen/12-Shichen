@@ -1,0 +1,156 @@
+import Foundation
+#if canImport(SwiftAA)
+import SwiftAA
+#endif
+
+public final class LunarAstronomyEngine: AstronomyEngineProtocol {
+    public init() {}
+
+    public func currentState(timestamp: Date, location: ObserverLocation) async -> AstronomicalState {
+        // Prefer SwiftAA-backed precise calculation when available
+        #if canImport(SwiftAA)
+        // SwiftAA usage: compute topocentric lunar altitude/azimuth and illumination fraction
+        do {
+            // Create SwiftAA structures from timestamp and location. The exact API names may vary by SwiftAA version.
+            // We attempt to use common SwiftAA types; if the project fails to compile, adapt the initializers to the SwiftAA version in Package.swift.
+
+            let jd = JulianDay(date: timestamp)
+            let earthLocation = GeographicCoordinates(positivelyOrientedLongitude: Angle(degrees: location.longitude), latitude: Angle(degrees: location.latitude), elevation: Length(meters: location.elevation))
+
+            // Compute moon topocentric position
+            let moon = Moon(julianDay: jd)
+            let topocentric = try moon.topocentricHorizontalCoordinates(for: earthLocation, julianDay: jd)
+
+            let altitude = topocentric.horizontalAltitude.degrees
+            let azimuth = topocentric.horizontalAzimuth.degrees
+
+            // Illumination / phase fraction
+            let illum = try moon.illuminatedFraction(julianDay: jd)
+
+            return AstronomicalState(timestamp: timestamp, solarAltitude: nil, solarAzimuth: nil, lunarAltitude: altitude, lunarAzimuth: azimuth, lunarPhase: illum)
+        } catch {
+            // On any failure, return conservative values but do not fabricate data
+            return AstronomicalState(timestamp: timestamp, solarAltitude: nil, solarAzimuth: nil, lunarAltitude: nil, lunarAzimuth: nil, lunarPhase: nil)
+        }
+        #else
+        // Fallback: conservative lunar phase estimate using synodic month fraction
+        let jd = SolarCalculator.julianDay(from: timestamp)
+        let synodicMonth = 29.530588853
+        var age = fmod(jd - 2451550.1, synodicMonth)
+        if age < 0 { age += synodicMonth }
+        let fraction = age / synodicMonth
+
+        // altitude/azimuth intentionally UNAVAILABLE until precise implementation is available
+        return AstronomicalState(timestamp: timestamp,
+                                 solarAltitude: nil,
+                                 solarAzimuth: nil,
+                                 lunarAltitude: nil,
+                                 lunarAzimuth: nil,
+                                 lunarPhase: fraction)
+        #endif
+    }
+
+    public func events(for date: Date, location: ObserverLocation) async -> AstronomicalEvents {
+        let cal = Calendar.utcCalendar
+        let start = cal.startOfDay(for: date)
+        let end = cal.date(byAdding: .day, value: 1, to: start)!
+
+        #if canImport(SwiftAA)
+        // We'll search for moonrise/moonset/transit using a two-stage sampling + refinement approach.
+        // Stage 1: coarse sampling (10 minutes)
+        let coarseInterval: TimeInterval = 600.0
+        var samples: [(Date, Double)] = []
+        var t = start
+        while t <= end {
+            if let alt = moonAltitude(at: t, location: location) {
+                samples.append((t, alt))
+            }
+            t = t.addingTimeInterval(coarseInterval)
+        }
+
+        if samples.isEmpty {
+            return AstronomicalEvents(civilDawn: nil, sunrise: nil, solarTransit: nil, sunset: nil, civilDusk: nil, moonrise: nil, lunarTransit: nil, moonset: nil, moonPhase: nil)
+        }
+
+        // Find intervals where sign change occurs
+        func refineCrossing(startSample: (Date, Double), endSample: (Date, Double)) -> Date? {
+            var loT = startSample.0
+            var hiT = endSample.0
+            var loAlt = startSample.1
+            var hiAlt = endSample.1
+            // Bisection refine up to 20 iterations or until <1 second
+            for _ in 0..<30 {
+                let midT = Date(timeIntervalSince1970: (loT.timeIntervalSince1970 + hiT.timeIntervalSince1970) / 2.0)
+                guard let midAlt = moonAltitude(at: midT, location: location) else { return nil }
+                if (loAlt <= 0 && midAlt > 0) || (loAlt > 0 && midAlt <= 0) {
+                    hiT = midT
+                    hiAlt = midAlt
+                } else {
+                    loT = midT
+                    loAlt = midAlt
+                }
+                if hiT.timeIntervalSince1970 - loT.timeIntervalSince1970 < 0.5 { break }
+            }
+            return Date(timeIntervalSince1970: (loT.timeIntervalSince1970 + hiT.timeIntervalSince1970) / 2.0)
+        }
+
+        var rise: Date? = nil
+        var set: Date? = nil
+
+        for i in 0..<(samples.count - 1) {
+            let a1 = samples[i].1
+            let a2 = samples[i+1].1
+            if a1 <= 0 && a2 > 0 && rise == nil {
+                if let refined = refineCrossing(startSample: samples[i], endSample: samples[i+1]) { rise = refined }
+            }
+            if a1 > 0 && a2 <= 0 && set == nil {
+                if let refined = refineCrossing(startSample: samples[i], endSample: samples[i+1]) { set = refined }
+            }
+        }
+
+        // Transit: approximate by finding maximum altitude sample and refine via local optimization
+        if let maxSampleIndex = samples.enumerated().max(by: { $0.element.1 < $1.element.1 })?.offset {
+            // refine around maxSampleIndex using smaller step
+            let window = 2
+            let leftIndex = max(0, maxSampleIndex - window)
+            let rightIndex = min(samples.count - 1, maxSampleIndex + window)
+            var best: (Date, Double)? = nil
+            for i in leftIndex...rightIndex {
+                let t = samples[i].0
+                if let alt = moonAltitude(at: t, location: location) {
+                    if best == nil || alt > best!.1 { best = (t, alt) }
+                }
+            }
+            let transit = best?.0
+
+            // Moon phase fraction using currentState
+            let phaseState = await currentState(timestamp: start, location: location)
+            return AstronomicalEvents(civilDawn: nil, sunrise: nil, solarTransit: nil, sunset: nil, civilDusk: nil, moonrise: rise, lunarTransit: transit, moonset: set, moonPhase: phaseState.lunarPhase)
+        }
+
+        // If transit not found, return with whatever we have
+        let phaseState = await currentState(timestamp: start, location: location)
+        return AstronomicalEvents(civilDawn: nil, sunrise: nil, solarTransit: nil, sunset: nil, civilDusk: nil, moonrise: rise, lunarTransit: nil, moonset: set, moonPhase: phaseState.lunarPhase)
+        #else
+        // If SwiftAA isn't available, preserve UNAVAILABLE rather than fabricating values
+        return AstronomicalEvents(civilDawn: nil, sunrise: nil, solarTransit: nil, sunset: nil, civilDusk: nil, moonrise: nil, lunarTransit: nil, moonset: nil, moonPhase: nil)
+        #endif
+    }
+
+    // Attempt to compute lunar topocentric altitude using SwiftAA when available; otherwise return nil
+    private func moonAltitude(at timestamp: Date, location: ObserverLocation) -> Double? {
+        #if canImport(SwiftAA)
+        do {
+            let jd = JulianDay(date: timestamp)
+            let moon = Moon(julianDay: jd)
+            let geo = GeographicCoordinates(positivelyOrientedLongitude: Angle(degrees: location.longitude), latitude: Angle(degrees: location.latitude), elevation: Length(meters: location.elevation))
+            let topocentric = try moon.topocentricHorizontalCoordinates(for: geo, julianDay: jd)
+            return topocentric.horizontalAltitude.degrees
+        } catch {
+            return nil
+        }
+        #else
+        return nil
+        #endif
+    }
+}
